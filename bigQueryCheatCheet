@@ -1,0 +1,1 @@
+#SELECT *  FROM `prod-data-enablement.datalake_salesforce_fivetran.alycecom_gift_c` where alycecom_claimed_gift_cost_value_c IS NOT NULL LIMIT 1000

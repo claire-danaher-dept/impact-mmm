@@ -1,0 +1,414 @@
+-- Get CTE on all opportunities
+WITH opportunity_data AS 
+(
+    SELECT 
+        id AS opportunity_18_digit_id,
+        accountid AS opp_accountid,
+        name AS opportunity_name,
+        ownersa_c AS opportunity_owner,
+        COALESCE(ownergeo_c, 'Unallocated') AS geo_segment,
+        stagename AS stage,
+        forecastcategoryname AS forecast_category,
+        true_nmrr_cpq_adjusted_converted_c AS true_nmrr_cpq_adjusted_converted,
+        CASE 
+            WHEN 
+                COALESCE(amount, 0) != 0 
+            THEN 
+                true_nmrr_cpq_adjusted_converted_c
+        WHEN 
+            COALESCE(amount, 0) = 0 
+            AND 
+            ((createddate >= '2023-08-01') OR (saas_date_c >= '2023-08-01')) 
+        THEN 
+            new_calculated_value_c
+        ELSE 
+            calculated_value_c 
+        END AS forecasted_pipeline_converted,
+        createddate AS created_date,
+        demo_completion_date_c AS demo_date,
+        diagnostic_completion_date_c AS diag_date,
+        qualified_date_c AS qualified_date,
+        saas_date_c AS saas_date,
+        closedate AS close_date,
+        opportunity_close_date_c AS opp_close_date, 
+        CASE 
+            WHEN 
+                isclosed IS TRUE 
+            THEN 
+                1 
+            ELSE 
+                0 
+        END AS isclosed,
+        CASE 
+            WHEN 
+                closedsum_c IS NULL 
+            THEN 
+                0 
+            ELSE 
+                1 
+        END AS closedsum_exists,
+        closedsum_c AS closed_sum,
+        CASE WHEN iswon IS TRUE 
+            THEN 
+                1 
+            ELSE 
+            0 
+        END AS iswon,
+        CASE 
+            WHEN 
+                wonsum_c IS NULL 
+            THEN 
+                0 
+            ELSE 
+                1 
+        END AS wonsum_exists,
+        wonsum_c AS won_sum,
+        CASE 
+            WHEN 
+                EXTRACT(MONTH FROM createddate) = 2 
+                AND 
+                EXTRACT(YEAR FROM createddate) = 2024 
+                AND 
+                saas_date_c IS NULL 
+            THEN 
+                1 
+            ELSE 
+                0 
+        END acquired_flag, -- what is this?
+        type,
+        opp_record_type_name_c AS opportunity_record_type,
+        CASE 
+            WHEN 
+                (expansion_opportunity_c IS TRUE OR type = 'Renewal') 
+            THEN 
+                1 
+            ELSE 
+                0 
+        END AS expansion_opportunity,
+        COALESCE(lead_source_group_c, 'Unallocated') AS lead_source_group,
+        COALESCE(leadsource, 'Unallocated') AS lead_source,
+        COALESCE(account_segment_stamp_c, 'Unallocated') AS opp_account_segment_stamp
+    FROM 
+        `prod-data-enablement.datalake_salesforce.opportunity`
+    WHERE 
+        UPPER(name) NOT LIKE '%BA TEST%'
+    AND 
+        UPPER(name) NOT LIKE '%TEST BA%'
+    AND   
+        UPPER(name) NOT LIKE '%BIZ APPS TEST OPP%'
+    AND   
+        UPPER(name) NOT LIKE '%SGD TESTING%'
+    AND
+        UPPER(name) NOT LIKE '%TEST 2 HOLDOVER%'
+),
+
+-- Get CTE on all account_IDs and their segments
+account_data AS (
+    SELECT 
+        id AS acc_accountid,
+        COALESCE(account_segment_fpa_c, 'Unallocated') AS acc_account_segment_fpa,
+        COALESCE(account_segment_c, 'Unallocated') AS acc_account_segment
+    FROM 
+        `prod-data-enablement.datalake_salesforce.account`
+),
+
+-- categorizes opportunities by stagename - but hasn't this already been doen in the opportunity_data CTE? This does aggregate a bit I suppose
+-- and also adds the expansion opportunity flag
+history_data AS (
+    SELECT 
+        a.opportunityid,
+        CASE
+            WHEN 
+                b.expansion_opportunity = 0 
+            THEN 
+                a.stagename
+            WHEN 
+                b.expansion_opportunity = 1 
+                AND 
+                a.stagename IN ('New', 'Outreach', 'Connection Phase', 'Diagnostic', 'Cross-Sell Introduction') 
+            THEN 
+                'Diagnostic'
+            WHEN 
+                b.expansion_opportunity = 1 
+                AND 
+                a.stagename IN ('Presentation Phase', 'Demo Phase', 'Champion Confirmed', 'Decision Maker Approved') 
+            THEN 
+                'Demo Phase'
+            WHEN 
+                b.expansion_opportunity = 1 
+                AND 
+                a.stagename IN ('Proposal') 
+            THEN 
+                'Proposal'
+            WHEN 
+                b.expansion_opportunity = 1 
+                AND 
+                a.stagename IN ('Procurement Review', 'Legal') 
+            THEN 
+                'Legal'
+            WHEN 
+                b.expansion_opportunity = 1 
+                AND 
+                a.stagename IN ('Signed Contract', 'Closed Won', 'Onboarding', 'Live') 
+            THEN 
+                'Signed Contract'
+            WHEN 
+                b.expansion_opportunity = 1 
+                AND 
+                a.stagename IN ('Churn', 'Closed Lost') 
+            THEN 
+                'Closed Lost'
+        END AS stagename,
+        a.createddate,
+        a.systemmodstamp,
+        a.datalake_dlu
+    FROM  
+        `prod-data-enablement.datalake_salesforce.opportunity_history` AS a
+    LEFT JOIN
+        opportunity_data AS b
+    ON 
+        a.opportunityid = b.opportunity_18_digit_id
+    WHERE a.stagename IN ('New','Outreach','Connection Phase','Diagnostic','Cross-Sell Introduction',
+                        'Presentation Phase','Demo Phase','Champion Confirmed','Decision Market Approved',
+                        'Proposal',
+                        'Procurement Review','Legal',
+                        'Signed Contract','Closed Won','Onboarding','Live',
+                        'Churn','Closed Lost')
+    ORDER BY 
+        a.opportunityid, a.systemmodstamp
+),
+-- another set of aggregations on the stagename with the first created date
+stage_data AS (
+    SELECT 
+        opportunityid,
+        stagename,
+        MIN(createddate) AS createddate
+    FROM 
+        history_data
+    GROUP BY 
+        opportunityid, 
+        stagename
+    ORDER BY 
+        opportunityid, 
+        createddate
+),
+-- Gets the previous created date for each opportunity
+-- this is used to get the previous stagename for each opportunity
+date_data AS (
+    SELECT *,
+        LAG(createddate, 1) OVER (PARTITION BY opportunityid ORDER BY createddate) AS prior_date
+    FROM 
+        stage_data
+    ORDER BY 
+        opportunityid, createddate
+),
+-- combines the two above CTEs to get the new and old stagenames
+-- (as well as the migration date)
+migration_data AS (
+    SELECT 
+        a.opportunityid,
+        a.stagename AS new_stagename,
+        COALESCE(b.stagename, 'None') AS old_stagename,
+        a.createddate AS migration_date
+    FROM 
+        date_data AS a
+    LEFT JOIN
+        stage_data AS b
+    ON 
+    a.opportunityid = b.opportunityid 
+    AND 
+    a.prior_date = b.createddate
+    ORDER BY 
+    a.opportunityid,
+    a.createddate
+),
+-- tries to get both migration date and the 'standard date' - but migration from what?
+dates_aggregated AS (
+SELECT 
+    a.opportunity_18_digit_id AS opportunityid,
+    a.opportunity_name,
+    a.opp_accountid AS accountid,
+    EXTRACT(DATE FROM a.created_date) AS opp_created_date,
+    a.saas_date  AS opp_saas_date,
+    a.diag_date  AS opp_diag_date,  
+    a.demo_date  AS opp_demo_date,
+    a.close_date AS opp_close_date,
+    EXTRACT(DATE FROM a.created_date)   AS mig_created_date,
+    EXTRACT(DATE FROM c.migration_date) AS mig_diag_date,
+    EXTRACT(DATE FROM d.migration_date) AS mig_demo_date,
+    EXTRACT(DATE FROM e.migration_date) AS mig_proposal_date,
+    EXTRACT(DATE FROM f.migration_date) AS mig_legal_date,
+    COALESCE(EXTRACT(DATE FROM g.migration_date), 
+    EXTRACT(DATE FROM h.migration_date)) AS mig_close_date,
+    a.isclosed,
+    a.iswon,       
+    a.type,
+    a.opportunity_record_type,
+    a.expansion_opportunity,
+    a.acquired_flag,
+    a.geo_segment,       
+    a.lead_source_group,
+    CASE 
+        WHEN 
+            a.lead_source_group IN ('Marketing','BDR','AE') 
+        THEN 
+            a.lead_source_group 
+        WHEN 
+            a.lead_source_group = 'Agency Partnerships' 
+        THEN 
+            'Agency'
+        ELSE 
+            'All Other' 
+        END AS lead_source_major,
+        COALESCE(b.acc_account_segment_fpa, b.acc_account_segment, a.opp_account_segment_stamp, 'Unallocated') AS account_segment,
+        CASE WHEN 
+            COALESCE(b.acc_account_segment_fpa, b.acc_account_segment, a.opp_account_segment_stamp, 'Unallocated') IN ('SMB','Mid-Market','Unallocated') 
+        THEN 
+            1 
+        ELSE 
+            0 
+    END AS commercial_flag,
+    a.true_nmrr_cpq_adjusted_converted,
+    a.forecasted_pipeline_converted   
+FROM 
+    opportunity_data AS a
+LEFT JOIN
+     account_data AS b
+ON 
+    a.opp_accountid = b.acc_accountid
+LEFT JOIN
+    (SELECT * FROM migration_data WHERE new_stagename = 'Diagnostic') AS c 
+ON 
+    a.opportunity_18_digit_id = c.opportunityid
+LEFT JOIN
+    (SELECT * FROM migration_data WHERE new_stagename = 'Demo Phase') AS d 
+ON 
+    a.opportunity_18_digit_id = d.opportunityid
+LEFT JOIN
+    (SELECT * FROM migration_data WHERE new_stagename = 'Proposal') AS e
+ON 
+    a.opportunity_18_digit_id = e.opportunityid
+LEFT JOIN
+    (SELECT * FROM migration_data WHERE new_stagename = 'Legal') AS f 
+ON 
+    a.opportunity_18_digit_id = f.opportunityid
+LEFT JOIN
+    (SELECT * FROM migration_data WHERE new_stagename = 'Signed Contract') AS g 
+ON 
+    a.opportunity_18_digit_id = g.opportunityid
+LEFT JOIN
+    (SELECT * FROM migration_data WHERE new_stagename = 'Closed Lost') AS h 
+ON 
+    a.opportunity_18_digit_id = h.opportunityid
+WHERE 
+    a.opportunity_record_type = 'PartnerManager'
+),  
+-- Get CTE on all users and their roles
+user_roles AS (
+    SELECT 
+        a.id, 
+        a.fullname_c AS username,
+        a.username AS user_email,
+        a.sub_geo_segment_c AS geo_segment,
+        a.team_c AS csm_team,
+        a.title,
+        a.employeenumber,
+        a.department,
+        a.userroleid,
+        b.name AS userrole
+    FROM 
+        `prod-data-enablement.datalake_salesforce.user` AS a
+    LEFT JOIN 
+        `prod-data-enablement.datalake_salesforce.user_role` AS b
+    ON 
+        a.userroleid = b.id
+),
+-- Get CTE on all tasks and events for each seller
+data_task AS (
+    SELECT 
+        a.ownerid,
+        a.ownerrole_c AS ownerrole,
+        a.accountid AS account_id,
+        DATE(a.completeddatetime) AS activity_date,
+        a.id AS activity_id,
+        CASE 
+            WHEN 
+                a.type IN ('Email','Follow-up','Other','Call','Prospecting','Blueprint','LinkedIn') 
+            THEN 
+                a.type 
+            ELSE 
+                'Other' 
+        END AS task_type,
+        a.tasksubtype AS task_subtype,
+        CASE 
+            WHEN 
+                a.activity_type_c IN ('Email','Call','BluePrint') 
+            THEN 
+                a.activity_type_c
+            WHEN 
+                a.activity_type_c LIKE '%LinkedIn%'               
+            THEN 
+                'LinkedIn'
+            ELSE 
+                'Other' 
+        END AS activity_type,
+        'Task' AS activity_source,
+        a.subject,
+        a.description,
+        a.whoid
+    FROM 
+        `prod-data-enablement.datalake_salesforce.task` AS a 
+    LEFT JOIN 
+        user_roles AS b
+    ON 
+        a.ownerid = b.id
+    WHERE 
+        a.status = 'Completed'
+    AND 
+        UPPER(b.username) NOT LIKE '%IMPACT%'
+    AND 
+        UPPER(b.username) NOT LIKE '%MARKETO ADMIN%'
+),
+-- tries to combine the events and build them into the task table
+data_event AS (
+    SELECT 
+        ownerid,
+        ownerrole_c AS ownerrole,
+        accountid AS account_id,
+        DATE(activitydatetime) AS activity_date,
+        id AS activity_id,
+        'Event' AS task_type,
+        'Event' AS task_subtype,
+        activity_type_c AS activity_type,
+        'Event' AS activity_source,
+        'None' AS subject,
+        'None' AS description,
+        whoid
+    FROM 
+        `prod-data-enablement.datalake_salesforce.event`
+    WHERE 
+        accountid IS NOT NULL
+),
+
+data_event_extras AS (
+    SELECT 
+        a.id,
+        a.relationid,
+        b.username AS relationname,
+        b.userrole AS relationrole,
+        a.status,
+        a.eventid,
+        c.ownerid,
+        d.username AS ownername,
+        d.userrole AS ownerrole,
+        c.subject AS eventsubject,
+        c.activity_type_c AS activity_type,
+        c.accountid,
+        c.activitydate AS event_date,
+        'None' AS subject,
+        'None' AS description,
+        c.whoid
+    FROM 
+        `prod-data-enablement.datalake_salesforce.event_relation` AS a 
+    LEFT JOIN
+        user_roles AS b
